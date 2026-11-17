@@ -1,76 +1,78 @@
 import json
-from pathlib import Path
+import os
 import networkx as nx
 from rapidfuzz import fuzz
+from src.persistence import save_graph
 
-def normalize_entity_name(name: str, existing_entities: set, threshold: int = 85) -> str:
+def normalize_entity_name(name: str, canonical_entities: set, threshold: int = 85) -> str:
     """
-    Compares a new entity name against already accepted entities using fuzzy matching.
-    If a close match is found, it maps the new name to the existing canonical name.
+    Normalizes an incoming entity name using rapidfuzz token_sort_ratio 
+    to match against existing canonical entities, preventing graph fragmentation.
     """
     if not name:
-        return ""
+        return "Unknown"
         
-    cleaned_name = name.strip().lower()
+    cleaned_name = name.strip()
     
-    for canonical in existing_entities:
-        # Compare strings using token sort ratio
-        score = fuzz.token_sort_ratio(cleaned_name, canonical.lower())
+    # If registry is empty, return the name as its own canonical reference
+    if not canonical_entities:
+        return cleaned_name
+        
+    # Check against existing canonical entities using fuzzy string matching
+    for canonical in canonical_entities:
+        score = fuzz.token_sort_ratio(cleaned_name.lower(), canonical.lower())
         if score >= threshold:
-            return canonical # Return the existing canonical name to merge them
+            return canonical
             
-    return name.strip() # If no match, return the original name as a new canonical entity
+    # If no match exceeds the threshold, treat it as a new unique entity
+    return cleaned_name
 
 def build_knowledge_graph(json_path: str, similarity_threshold: int = 85) -> nx.DiGraph:
     """
-    Loads extracted JSON triplets, normalizes entities to fix duplicates, 
-    and constructs a directed graph using NetworkX.
+    Reads extracted triplets from JSON, resolves entity name variations, 
+    and constructs a directed NetworkX graph.
     """
-    print(f"Loading triplets from: {json_path}...")
-    
-    with open(json_path, "r", encoding="utf-8") as f:
+    if not os.path.exists(json_path):
+        raise FileNotFoundError(f"[ERROR] Triplet file not found at {json_path}")
+        
+    with open(json_path, 'r', encoding='utf-8') as f:
         triplets = json.load(f)
         
     G = nx.DiGraph()
     canonical_entities = set()
     
+    print(f"[INFO] Processing {len(triplets)} raw triplets for graph construction...")
+    
     for item in triplets:
-        raw_subject = item.get("subject")
-        predicate = item.get("predicate")
-        raw_object = item.get("object")
+        raw_subj = item.get("subject", "")
+        predicate = item.get("predicate", "relates_to")
+        raw_obj = item.get("object", "")
         
-        if raw_subject and raw_object and predicate:
-            # Normalize subject and object to prevent duplicates
-            subject = normalize_entity_name(raw_subject, canonical_entities, similarity_threshold)
-            canonical_entities.add(subject)
+        if not raw_subj or not raw_obj:
+            continue
             
-            object_node = normalize_entity_name(raw_object, canonical_entities, similarity_threshold)
-            canonical_entities.add(object_node)
-            
-            # Add edge with the normalized nodes
-            G.add_edge(subject, object_node, relation=predicate)
-            
-    print(f"Successfully built normalized graph with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges.")
+        # Apply entity resolution and normalization
+        subj = normalize_entity_name(raw_subj, canonical_entities, similarity_threshold)
+        canonical_entities.add(subj)
+        
+        obj = normalize_entity_name(raw_obj, canonical_entities, similarity_threshold)
+        canonical_entities.add(obj)
+        
+        # Add edge with the relational predicate attribute
+        G.add_edge(subj, obj, relation=predicate)
+        
     return G
 
-def analyze_graph(G: nx.DiGraph):
-    """
-    Runs basic dependency audits and prints graph metrics.
-    """
-    print("\n--- Graph Dependency Audit ---")
-    print(f"Total Components (Nodes): {G.number_of_nodes()}")
-    print(f"Total Relationships (Edges): {G.number_of_edges()}")
-    
-    print("\nTop Connected Components:")
-    degrees = sorted(G.degree, key=lambda x: x[1], reverse=True)
-    for node, deg in degrees[:5]:
-        print(f" - '{node}' (Connections: {deg})")
-
 if __name__ == "__main__":
-    json_path = "data/processed_markdown/extracted_triplets.json"
+    triplets_file = "data/extracted_triplets.json"
+    graph_output_path = "data/knowledge_graph.graphml"
     
-    if Path(json_path).exists():
-        graph = build_knowledge_graph(json_path)
-        analyze_graph(graph)
-    else:
-        print(f"Triplet JSON file not found at {json_path}. Run extractor.py first!")
+    # 1. Build the normalized NetworkX graph
+    G = build_knowledge_graph(json_path=triplets_file, similarity_threshold=85)
+    
+    print(f"[SUCCESS] Knowledge Graph built successfully!")
+    print(f"          - Total Nodes: {G.number_of_nodes()}")
+    print(f"          - Total Edges: {G.number_of_edges()}")
+    
+    # 2. Persist the graph to disk for downstream tasks and GraphRAG
+    save_graph(G, filepath=graph_output_path)
